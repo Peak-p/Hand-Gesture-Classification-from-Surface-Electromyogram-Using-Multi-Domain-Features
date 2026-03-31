@@ -49,7 +49,7 @@ Key Insights
 
 - Subject-specific calibration remains essential for amputee participants.
 
-🔮 Future Work
+ Future Work
 - Adaptive algorithms (transfer learning, semi-supervised learning)
 
 - Multimodal sensing (e.g., tactile + thermal fusion)
