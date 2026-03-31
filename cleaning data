@@ -1,0 +1,80 @@
+import scipy.io
+import pandas as pd
+import numpy as np
+import os
+import glob
+
+# ระบุที่อยู่โฟลเดอร์ที่เก็บไฟล์ .mat
+folder_path = r"C:\Users\พีค\OneDrive\เดสก์ท็อป\Data sci (NSTDA)\raw data"  # แก้ไขเป็นที่อยู่โฟลเดอร์ของคุณ
+
+# ค้นหาไฟล์ .mat ทั้งหมดในโฟลเดอร์ที่ระบุ
+mat_files = glob.glob(os.path.join(folder_path, "*.mat"))
+
+for file in mat_files:
+    # ดึงชื่อไฟล์พื้นฐาน เช่น 'S016' จาก 'S016_ex1.mat'
+    base_name = os.path.basename(file).split("_")[0]
+    
+    # โหลดไฟล์ .mat
+    mat_data = scipy.io.loadmat(file)
+    
+    # ดึงข้อมูลที่ต้องการ
+    grasp_data = mat_data['grasp']
+    grasprepetition_data = mat_data['grasprepetition']
+    object_data = mat_data['object']
+    objectpart_data = mat_data['objectpart']
+    objectrepetition_data = mat_data['objectrepetition']
+    position_data = mat_data['position']
+    dynamic_data = mat_data['dynamic']
+    regrasp_data = mat_data['regrasp']
+    regrasprepetition_data = mat_data['regrasprepetition']
+    reobject_data = mat_data['reobject']
+    reobjectpart_data = mat_data['reobjectpart']
+    emg_data = mat_data['emg']  # เพิ่มการดึงข้อมูล emg
+
+    # สร้าง Dictionary สำหรับเก็บข้อมูล
+    data_prototype = {
+        'Grasp ID': [],
+        'Grasp Repetition': [],
+        'Object': [],
+        'Object Part': [],
+        'Object Repetition': [],
+        'Position': [],
+        'Dynamic': [],
+        'Re-Grasp': [],
+        'Re-Grasp-Repetition': [],
+        'Re-Object': [],
+        'Re-Object-Part': [],
+        'EMG Signal': []  # เพิ่มคีย์สำหรับ EMG
+    }
+
+    # วนลูปเพื่อดึงข้อมูล
+    for i in range(len(grasp_data)):
+        data_prototype['Grasp ID'].append(grasp_data[i][0])
+        data_prototype['Grasp Repetition'].append(grasprepetition_data[i][0])
+        data_prototype['Object'].append(object_data[i][0])
+        data_prototype['Object Part'].append(objectpart_data[i][0])
+        data_prototype['Object Repetition'].append(objectrepetition_data[i][0])
+        data_prototype['Position'].append(position_data[i][0])
+        data_prototype['Dynamic'].append(dynamic_data[i][0])
+        data_prototype['Re-Grasp'].append(regrasp_data[i][0])
+        data_prototype['Re-Grasp-Repetition'].append(regrasprepetition_data[i][0])
+        data_prototype['Re-Object'].append(reobject_data[i][0])
+        data_prototype['Re-Object-Part'].append(reobjectpart_data[i][0])
+        data_prototype['EMG Signal'].append(emg_data[i])  # เพิ่มการเก็บข้อมูล emg
+
+    # แปลงเป็น DataFrame
+    df = pd.DataFrame(data_prototype)
+
+    # กรองแถวที่มี Object Repetition เป็น -3 หรือ -2 ออก
+    df = df[~df['Object Repetition'].isin([-3, -2])]
+
+    # กรองแถวที่มี Grasp ID เป็น 0 ออก
+    df = df[df['Grasp ID'] != 0]
+
+    # บันทึกเป็นไฟล์ CSV โดยใช้ชื่อไฟล์พื้นฐาน
+    output_filename = os.path.join(folder_path, f"processed_{base_name}.csv")
+    df.to_csv(output_filename, index=False)
+
+    # แสดงตัวอย่างข้อมูล
+    print(f"Processed {file} -> {output_filename}")
+    print(df.head())
