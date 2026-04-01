@@ -1,0 +1,518 @@
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold, GroupKFold # GroupKFold is used for subject splitting
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_score, recall_score
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
+import lightgbm as lgb
+from collections import defaultdict
+import gc # Import garbage collectorฟ
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import re
+import time
+
+# --- Configuration ---
+random_seed = 42
+
+# N_Splits for Subject-based K-Fold Cross-Validation (for Scenario 2 - Inter-subject outer split)
+n_splits_subject_cv = 3 
+
+# Best Hyperparameters for XGBoost
+best_xgb_params = {
+    'colsample_bytree': 0.8,
+    'eval_metric': 'mlogloss',
+    'learning_rate': 0.1,
+    'max_depth': 10,
+    'n_estimators': 300,
+    'subsample': 0.8,
+    'random_state': random_seed,
+    'n_jobs': 1,
+    'tree_method': 'hist'
+}
+
+# Best Hyperparameters for RandomForest
+best_rf_params = {
+    'class_weight': 'balanced',     
+    'max_depth': 30,     
+    'min_samples_leaf': 1,     
+    'min_samples_split': 2,     
+    'n_estimators': 550,
+    'random_state': random_seed,
+    'n_jobs': 1
+}
+
+# Best Hyperparameters for LGBM
+best_lgbm_params = {
+    'learning_rate': 0.1,     
+    'max_depth': 20,     
+    'n_estimators': 200,     
+    'num_leaves': 63,
+    'class_weight': 'balanced',
+    'random_state': random_seed,
+    'n_jobs': 1
+}
+
+# Models to evaluate
+models_to_evaluate = {
+    "XGBoost": xgb.XGBClassifier(**best_xgb_params),
+    "RandomForest": RandomForestClassifier(**best_rf_params),
+    "LightGBM": lgb.LGBMClassifier(**best_lgbm_params)
+}
+
+# Data Folder (adjust this to your actual data location if not using mock data)
+extracted_features_output_parquet_folder = '/home/ubuntu/Documents/Peak/extracted_features_output/'
+os.makedirs(extracted_features_output_parquet_folder, exist_ok=True)
+
+# Output folder for saving plots
+output_plot_folder = './model_evaluation_plots'
+os.makedirs(output_plot_folder, exist_ok=True)
+
+# Global dictionary to store results
+results_summary_dict = {}
+
+# --- Helper function to plot confusion matrix ---
+def plot_confusion_matrix(y_true, y_pred, labels, title="Confusion Matrix"):
+    """
+    Generates and displays a heatmap of the confusion matrix.
+    """
+    if len(np.unique(y_true)) < 2:  
+        print(f"⚠️ Skipping confusion matrix plot for '{title}': Not enough unique true labels.")
+        return
+
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    display_labels = [f'Grasp {l + 1}' for l in labels]
+
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',      
+                xticklabels=display_labels, yticklabels=display_labels,
+                annot_kws={"size": 10})
+    
+    plt.title(title, fontsize=14)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.ylabel('True Label', fontsize=12)
+    
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+
+    plt.tight_layout()
+    filename = re.sub(r'[^\w\s.-]', '', title).replace(' ', '_').replace('__', '_') + ".png"  
+    plot_path = os.path.join(output_plot_folder, filename)
+    plt.savefig(plot_path)
+    print(f"✅ Confusion matrix saved to: {plot_path}")
+    plt.close('all') 
+
+def plot_scenario2_accuracy(results_summary, plot_folder, filename="scenario2_accuracy_comparison.png"):
+    """
+    Generates and saves a bar chart comparing Accuracy for Scenario 2 only.
+    Includes error bars if standard deviation is available.
+    """
+    plot_data = []
+    
+    scenario_2_key_phrase = f"Inter-subject {n_splits_subject_cv}-Fold CV"
+    
+    filtered_results_summary = {
+        k: v for k, v in results_summary.items() 
+        if scenario_2_key_phrase in k
+    }
+
+    for model_scenario, metrics in filtered_results_summary.items(): 
+        parts = model_scenario.split(' (')
+        model_name = parts[0]
+        
+        group_name_match = re.search(r'\((inact|imputee|All Subjects)\)', model_scenario) 
+        group_name = group_name_match.group(1) if group_name_match else "Unknown Group"
+
+        accuracy_str = metrics["Accuracy"].split(' ± ')[0]
+        accuracy = float(accuracy_str) if accuracy_str not in ["N/A", "Error"] else np.nan
+        
+        std_str = metrics["Accuracy"].split(' ± ')
+        std_dev = float(std_str[1]) if len(std_str) > 1 and std_str[1] != 'nan' else np.nan
+        
+        plot_data.append({'Model': model_name, 'Group': group_name, 'Accuracy': accuracy, 'Accuracy_SD': std_dev})
+
+    plot_data = [d for d in plot_data if not np.isnan(d['Accuracy'])]
+
+    if not plot_data:
+        print("No Scenario 2 results found to plot accuracy.")
+        return
+
+    df_plot = pd.DataFrame(plot_data)
+    
+    plt.figure(figsize=(12, 7))
+    sns.barplot(x='Model', y='Accuracy', hue='Group', data=df_plot, palette='magma', errorbar='sd', capsize=0.1)
+    plt.title(f'Model Accuracy Comparison for Scenario 2 (Inter-subject {n_splits_subject_cv}-Fold CV)', fontsize=14) 
+    plt.xlabel('Model', fontsize=12)
+    plt.ylabel('Accuracy (%)', fontsize=12)
+    plt.ylim(0, 100)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.legend(title='Group')
+    plt.tight_layout()
+
+    plot_path = os.path.join(plot_folder, filename)
+    plt.savefig(plot_path)
+    print(f"✅ Scenario 2 accuracy comparison graph saved to: {plot_path}")
+    plt.close('all') 
+
+# --- Helper function to print scenario-specific summary ---
+def print_scenario_summary(results_dict, scenario_type_str, group_name_filter=None, title="Scenario Summary"):
+    """
+    Filters results for a specific scenario and prints a summary table.
+    """
+    filtered_results = {}
+    for key, value in results_dict.items():
+        if scenario_type_str in key:
+            if group_name_filter is None or f'({group_name_filter})' in key:
+                filtered_results[key] = value
+
+    if filtered_results:
+        summary_df = pd.DataFrame.from_dict(filtered_results, orient='index')
+        summary_df.index.name = "Model - Scenario - Group"
+        print(f"\n--- {title} ---")
+        print(summary_df[['Accuracy', 'Precision', 'Recall', 'F1-Macro']].to_markdown(numalign="left", stralign="left"))
+        print("-" * (len(title) + 8))
+
+# --- Function to create mock data to run the script ---
+def create_mock_data(output_folder, num_subjects_inact=31, num_subjects_imputee=14, num_channels=8, num_reps=8, num_grasps=12, samples_per_rep_for_window=100):
+    """
+    Creates mock Parquet files with the expected structure and a synthetic signal for the script to run.
+    """
+    print(f"Creating mock data for testing with {samples_per_rep_for_window} samples per repetition...")
+    
+    inact_subjects = [f'S{i:03d}' for i in range(10, 10 + num_subjects_inact)]
+    imputee_subjects = [f'S{i:03d}' for i in range(101, 101 + num_subjects_imputee)]
+    
+    subject_ids = inact_subjects + imputee_subjects
+    
+    for subject_id in tqdm(subject_ids, desc="Creating mock Parquet files"):
+        data = defaultdict(list)
+        
+        for grasp_id in range(1, num_grasps + 1):
+            for rep in range(1, num_reps + 1):
+                emg_features = np.random.rand(samples_per_rep_for_window, num_channels) * 0.05 
+                signal_offset = (grasp_id * 0.1) + (rep * 0.01) 
+                emg_features += signal_offset
+                
+                for i in range(num_channels):
+                    data[f'Ch{i+1}_feature_1'].extend(emg_features[:, i])
+                    data[f'Ch{i+1}_feature_2'].extend(np.random.rand(samples_per_rep_for_window)) 
+
+                data['grasp_id'].extend([grasp_id] * samples_per_rep_for_window)
+                data['Grasp Repetition'].extend([rep] * samples_per_rep_for_window)
+        
+        df = pd.DataFrame(data)
+        file_name = f'cleaned_single_grasp_{subject_id}.parquet'
+        df.to_parquet(os.path.join(output_folder, file_name))
+        
+        del df, data 
+        gc.collect() 
+        
+    print(f"Mock data creation complete. {len(subject_ids)} files created in '{output_folder}'.")
+
+
+# --- Function to load data for specific repetitions across multiple files or from a DataFrame ---
+def load_data_for_reps(file_list_or_df, reps_list=None, data_folder=None):
+    """
+    Loads data for a specific list of repetition IDs.
+    If reps_list is None or empty, loads all repetitions.
+    Can accept either a list of file names (and data_folder) or a DataFrame.
+    Returns X_data, y_data.
+    """
+    features_list = []
+    labels_list = []
+    
+    if isinstance(file_list_or_df, pd.DataFrame):
+        df = file_list_or_df
+        df_filtered = df
+        if reps_list: # Only filter if reps_list is provided
+            df_filtered = df[df['Grasp Repetition'].isin(reps_list)].copy() 
+
+        if not df_filtered.empty:
+            emg_feature_cols = [col for col in df_filtered.columns if col.startswith('Ch')]
+            if emg_feature_cols and 'grasp_id' in df_filtered.columns:
+                features_list.append(df_filtered[emg_feature_cols].values)
+                labels_list.append(df_filtered['grasp_id'].values.flatten() - 1)
+        del df_filtered 
+        gc.collect() 
+
+    elif isinstance(file_list_or_df, list):
+        for file_name in tqdm(file_list_or_df, desc="Loading data from files"):
+            file_path = os.path.join(data_folder, file_name)
+            if os.path.exists(file_path):
+                try:
+                    df = pd.read_parquet(file_path)
+                except Exception as e:
+                    print(f"❌ Error reading parquet file {file_name}: {e}. Skipping this file.")
+                    continue
+
+                df_filtered = df
+                if reps_list: # Only filter if reps_list is provided
+                    df_filtered = df[df['Grasp Repetition'].isin(reps_list)].copy() 
+
+                if not df_filtered.empty:
+                    emg_feature_cols = [col for col in df_filtered.columns if col.startswith('Ch')]
+                    if emg_feature_cols and 'grasp_id' in df_filtered.columns:
+                        features_list.append(df_filtered[emg_feature_cols].values)
+                        labels_list.append(df_filtered['grasp_id'].values.flatten() - 1)
+                
+                del df, df_filtered 
+                gc.collect() 
+    else:
+        raise ValueError("file_list_or_df must be a list of file names or a pandas DataFrame.")
+
+    if not features_list:
+        return np.array([]).reshape(0, 0), np.array([])
+    
+    X_data = np.vstack(features_list)
+    y_data = np.concatenate(labels_list)
+    
+    return X_data, y_data
+
+
+# --- Evaluation Function (Inter-subject without Repetition-based inner CV) ---
+def evaluate_model_inter_subject_cv(model_instance_template, all_available_files_list, target_subjects_for_group, model_name, group_name, num_classes, n_splits_subject_cv_param):
+    """
+    Evaluates a model using GroupKFold Cross-Validation for Inter-subject evaluation.
+    Subjects are split into folds, ensuring no subject appears in both train and test sets for a fold.
+    All repetitions within the train/test subjects are used directly.
+    Data is loaded dynamically per subject-fold to reduce memory footprint.
+    """
+    print(f"\n--- Training and evaluating {model_name} on {group_name} ({n_splits_subject_cv_param}-Fold Inter-subject CV) ---")
+
+    # Filter all_available_files_list to get only files for target_subjects_for_group
+    files_in_current_group = [
+        f_name for f_name in all_available_files_list 
+        if re.search(r'S(\d{3})', f_name) and f'S{re.search(r"S(\d{3})", f_name).group(1)}' in target_subjects_for_group
+    ]
+    
+    if not files_in_current_group:
+        print(f"⚠️ Warning: No files found for group '{group_name}' in Inter-subject CV. Skipping.")
+        return
+
+    # Extract unique subject IDs for GroupKFold from the filtered files
+    group_subject_ids = np.unique([
+        f'S{re.search(r"S(\d{3})", f_name).group(1)}'
+        for f_name in files_in_current_group if re.search(r'S(\d{3})', f_name)
+    ])
+
+    if len(group_subject_ids) < 2:
+        print(f"⚠️ Warning: Not enough unique subjects ({len(group_subject_ids)}) in {group_name} for Inter-subject CV. Skipping.")
+        return
+
+    # Dynamic adjustment for n_splits_subject_cv_param
+    actual_n_splits_group_cv = n_splits_subject_cv_param
+    if len(group_subject_ids) < n_splits_subject_cv_param:
+        actual_n_splits_group_cv = len(group_subject_ids)
+        print(f"⚠️ Warning: Not enough unique subjects ({len(group_subject_ids)}) in {group_name} for {n_splits_subject_cv_param}-fold Inter-subject CV. Adjusting n_splits to {actual_n_splits_group_cv}.")
+    
+    if actual_n_splits_group_cv < 2:
+        print(f"⚠️ Cannot perform GroupKFold as number of unique subjects ({len(group_subject_ids)}) or adjusted n_splits ({actual_n_splits_group_cv}) is too low. Skipping.")
+        return
+
+    all_accuracies_overall = []
+    all_precisions_overall = []
+    all_recalls_overall = []
+    all_f1_macros_overall = []
+    
+    all_y_true_inter_cv = []
+    all_y_pred_inter_cv = []
+
+    group_kfold = GroupKFold(n_splits=actual_n_splits_group_cv)
+    
+    # X and y for group_kfold.split can be dummy arrays as long as they match the length of group_subject_ids
+    dummy_X = np.zeros((len(group_subject_ids), 1))
+    dummy_y = np.zeros(len(group_subject_ids))
+
+    for subject_fold_num, (train_subject_indices, test_subject_indices) in enumerate(group_kfold.split(dummy_X, dummy_y, group_subject_ids), 1):
+        print(f"\n  --- {group_name} Inter-subject Outer Fold {subject_fold_num}/{actual_n_splits_group_cv} ---")
+        
+        current_train_subjects = group_subject_ids[train_subject_indices]
+        current_test_subjects = group_subject_ids[test_subject_indices]
+
+        # Get file names for current train/test subjects based on the full list of cleaned_parquet_files
+        train_files_in_fold = [
+            f for f in all_available_files_list
+            if re.search(r'S(\d{3})', f) and f'S{re.search(r"S(\d{3})", f).group(1)}' in current_train_subjects
+        ]
+        test_files_in_fold = [
+            f for f in all_available_files_list
+            if re.search(r'S(\d{3})', f) and f'S{re.search(r"S(\d{3})", f).group(1)}' in current_test_subjects
+        ]
+
+        print(f"    Train Subjects: {sorted(list(current_train_subjects))}")
+        print(f"    Test Subjects: {sorted(list(current_test_subjects))}")
+
+        if not train_files_in_fold or not test_files_in_fold:
+            print(f"  ⚠️ Warning: Subject Fold {subject_fold_num} has empty train/test subject list. Skipping.")
+            continue
+
+        # Load data directly for the specified files (all repetitions)
+        X_train_fold, y_train_fold = load_data_for_reps(train_files_in_fold, reps_list=None, data_folder=extracted_features_output_parquet_folder)
+        X_test_fold, y_test_fold = load_data_for_reps(test_files_in_fold, reps_list=None, data_folder=extracted_features_output_parquet_folder)
+
+        if X_train_fold.shape[0] == 0 or len(y_train_fold) == 0:
+            print(f"  ⚠️ Warning: Train set for Subject Fold {subject_fold_num} is empty or labels are missing. Skipping this Fold.")
+            del X_test_fold, y_test_fold # Clean up test data if train is bad
+            gc.collect()
+            continue
+        if X_test_fold.shape[0] == 0 or len(y_test_fold) == 0:
+            print(f"  ⚠️ Warning: Test set for Subject Fold {subject_fold_num} is empty or labels are missing. Skipping this Fold.")
+            del X_train_fold, y_train_fold # Clean up train data if test is bad
+            gc.collect()
+            continue
+        
+        if len(np.unique(y_train_fold)) < 2 or len(np.unique(y_test_fold)) < 2:
+            print(f"⚠️ Warning: Subject Fold {subject_fold_num} has less than 2 unique classes in train or test set. Skipping this Fold.")
+            del X_train_fold, y_train_fold, X_test_fold, y_test_fold # Clean up
+            gc.collect()
+            continue
+
+        scaler_ind_fold = StandardScaler()
+        X_train_scaled_ind_fold = scaler_ind_fold.fit_transform(X_train_fold)
+        X_test_scaled_ind_fold = scaler_ind_fold.transform(X_test_fold)
+
+        model_instance_ind = model_instance_template.__class__(**model_instance_template.get_params())
+        if isinstance(model_instance_ind, xgb.XGBClassifier):
+            model_instance_ind.set_params(num_class=num_classes)
+        elif isinstance(model_instance_ind, lgb.LGBMClassifier):
+            model_instance_ind.set_params(num_class=num_classes)
+
+        try:
+            model_instance_ind.fit(X_train_scaled_ind_fold, y_train_fold.ravel())
+            y_pred_ind_fold = model_instance_ind.predict(X_test_scaled_ind_fold)
+
+            all_accuracies_overall.append(accuracy_score(y_test_fold, y_pred_ind_fold))
+            all_precisions_overall.append(precision_score(y_test_fold, y_pred_ind_fold, average="macro", zero_division=0))
+            all_recalls_overall.append(recall_score(y_test_fold, y_pred_ind_fold, average="macro", zero_division=0))
+            all_f1_macros_overall.append(f1_score(y_test_fold, y_pred_ind_fold, average="macro", zero_division=0))
+
+            all_y_true_inter_cv.extend(y_test_fold)
+            all_y_pred_inter_cv.extend(y_pred_ind_fold)
+
+            print(f"      {model_name} Accuracy: {all_accuracies_overall[-1]:.4f}")
+        except Exception as e:
+            print(f"❌ Error during training/prediction for {model_name}, Subject Fold {subject_fold_num}: {e}. Skipping this fold.")
+        finally:
+            del X_train_fold, y_train_fold, X_test_fold, y_test_fold
+            del X_train_scaled_ind_fold, X_test_scaled_ind_fold
+            del model_instance_ind 
+            gc.collect()
+        
+    if all_accuracies_overall:
+        avg_acc_ind = np.mean(all_accuracies_overall)
+        std_acc_ind = np.std(all_accuracies_overall)
+        avg_prec_ind = np.mean(all_precisions_overall)
+        std_prec_ind = np.std(all_precisions_overall)
+        avg_rec_ind = np.mean(all_recalls_overall)
+        std_rec_ind = np.std(all_recalls_overall)
+        avg_f1_ind = np.mean(all_f1_macros_overall)
+        std_f1_ind = np.std(all_f1_macros_overall)
+    else:
+        avg_acc_ind = std_acc_ind = np.nan
+        avg_prec_ind = std_prec_ind = np.nan
+        avg_rec_ind = std_rec_ind = np.nan
+        avg_f1_ind = std_f1_ind = np.nan
+        print(f"  No successful folds completed for {model_name} in Inter-subject CV.")
+
+
+    results_summary_dict[f"{model_name} ({group_name}) (Inter-subject {n_splits_subject_cv_param}-Fold CV)"] = {
+        "Accuracy": f"{avg_acc_ind * 100:.2f} ± {std_acc_ind * 100:.2f}" if not np.isnan(avg_acc_ind) else "N/A",
+        "Precision": f"{avg_prec_ind * 100:.2f} ± {std_prec_ind * 100:.2f}" if not np.isnan(avg_acc_ind) else "N/A",
+        "Recall": f"{avg_rec_ind * 100:.2f} ± {std_rec_ind * 100:.2f}" if not np.isnan(avg_acc_ind) else "N/A",
+        "F1-Macro": f"{avg_f1_ind * 100:.2f} ± {std_f1_ind * 100:.2f}" if not np.isnan(avg_acc_ind) else "N/A"
+    }
+    
+    print(f"\nAverage {model_name} Accuracy ({group_name} Inter-subject CV): {avg_acc_ind:.4f} ± {std_acc_ind:.4f}" if not np.isnan(avg_acc_ind) else f"\nAverage {model_name} Accuracy ({group_name} Inter-subject CV): N/A")
+    
+    if all_y_true_inter_cv and all_y_pred_inter_cv and num_classes > 0 and len(np.unique(all_y_true_inter_cv)) > 1:
+        labels_for_cm = np.arange(num_classes)
+        plot_confusion_matrix(all_y_true_inter_cv, all_y_pred_inter_cv, labels_for_cm, title=f"{model_name} {group_name} Inter-subject Aggregated Confusion Matrix")
+    
+    del group_subject_ids 
+    gc.collect()
+
+
+# --- Main Script Execution ---
+start_time_total = time.time()
+
+try:
+    print(f"Loading individual subject .parquet files from: {extracted_features_output_parquet_folder}")
+    
+    if not os.path.exists(extracted_features_output_parquet_folder) or not os.listdir(extracted_features_output_parquet_folder):
+        print("⚠️ No data files found in the specified directory. Creating mock data for demonstration.")
+        create_mock_data(extracted_features_output_parquet_folder, samples_per_rep_for_window=100) 
+
+    cleaned_parquet_files = [f for f in os.listdir(extracted_features_output_parquet_folder) if f.startswith('cleaned_single_grasp_S') and f.endswith('.parquet')]
+    
+    if not cleaned_parquet_files:
+        raise FileNotFoundError(f"No 'cleaned_single_grasp_SXXX.parquet' files found in '{extracted_features_output_parquet_folder}'. Please check the path and file names.")
+    
+    # Determine num_unique_classes by loading only the first file
+    num_unique_classes = 0
+    if cleaned_parquet_files:
+        try:
+            sample_df = pd.read_parquet(os.path.join(extracted_features_output_parquet_folder, cleaned_parquet_files[0]))
+            num_unique_classes = len(np.unique(sample_df['grasp_id'].values))
+            del sample_df 
+            gc.collect() 
+        except Exception as e:
+            print(f"❌ Error reading sample file to determine number of classes: {e}. Assuming 12 classes for mock data.")
+            num_unique_classes = 12 # Fallback for mock data
+
+    if num_unique_classes < 2:
+        raise ValueError(f"Insufficient unique 'grasp_id' (found {num_unique_classes}). Classification requires at least 2 classes.")
+
+
+    # Combine all files into a single list for processing (for "All Subjects" group)
+    all_combined_files = sorted(cleaned_parquet_files)
+    
+    if not all_combined_files:
+        print("\n⚠️ Warning: No files found for any subjects. Skipping evaluation.")
+    else:
+        general_group_name = "All Subjects" 
+
+        # --- Scenario 2: Inter-subject Cross-Validation ---
+        print(f"\n\n====================== Starting Evaluation for Scenario 2 ======================")
+        print(f"\n========== Scenario 2: {general_group_name} Inter-subject ({n_splits_subject_cv}-Fold CV) ==========")
+        for model_name, model_instance_template in models_to_evaluate.items():
+            evaluate_model_inter_subject_cv(model_instance_template, all_combined_files, 
+                                            [f'S{re.search(r"S(\d{3})", f).group(1)}' for f in all_combined_files if re.search(r'S(\d{3})', f)], # Corrected line
+                                            model_name, general_group_name, num_unique_classes, 
+                                            n_splits_subject_cv)
+        
+        # Print summary for Scenario 2
+        print_scenario_summary(results_summary_dict, f"Inter-subject {n_splits_subject_cv}-Fold CV", 
+                               general_group_name, f"สรุปผล Scenario 2: Inter-subject ({general_group_name})")
+
+        gc.collect() 
+        print(f"\n✅ Memory cleared after {general_group_name} Inter-subject CV evaluation.")
+
+
+    # --- Summary Table and Plot (filtered for Scenario 2) ---
+    print("\n\n========== Final Experiment Summary ==========")
+    if results_summary_dict:
+        # Plotting the accuracy chart for Scenario 2
+        plot_scenario2_accuracy(results_summary_dict, output_plot_folder)
+            
+    else:
+        print("No results to summarize for Scenario 2.")
+
+except FileNotFoundError as e:
+    print(f"File Error: {e}")
+    print("Please ensure the data folder path is correct and contains the necessary .parquet files.")
+except ValueError as e:
+    print(f"Configuration Error: {e}")
+    print("Please check data integrity, specifically the number of unique grasp_id classes.")
+except Exception as e:
+    print(f"An unexpected error occurred: {e}")
+    import traceback
+    traceback.print_exc()
+
+finally:
+    end_time_total = time.time()
+    print(f"\nTotal script execution time: {end_time_total - start_time_total:.2f} seconds")
+    print("All evaluations complete!")
+    gc.collect()
