@@ -8,59 +8,70 @@ from tqdm import tqdm
 import time
 import ast
 
-# --- ค่ากำหนด (ปรับตาม Sliding Window) ---
-sampling_rate = 2000  # Hz
-window_size_samples = 400  # ขนาด Window 400 samples
-overlap_percent = 0.0
-step_size_samples = window_size_samples  # Step เท่ากับขนาด Window
-chunksize = 1000
-folder_path = r'C:\Users\พีค\OneDrive\เดสก์ท็อป\Data sci (NSTDA)\DataPrep'  # โฟลเดอร์ที่เก็บไฟล์ processed_*.csv
-output_folder = r'C:\Users\พีค\OneDrive\เดสก์ท็อป\Data sci (NSTDA)\train&test_window_size_samples _400'  # โฟลเดอร์สำหรับเก็บไฟล์ cleaned ที่มี grasp เดี่ยว
+# --- Signal Processing Libraries ---
+from scipy.signal import butter, filtfilt, iirnotch
+import pywt # Make sure PyWavelets is installed: pip install PyWavelets
 
+# --- Configuration (Adjust for Sliding Window) ---
+sampling_rate = 2000  # Hz
+window_size_ms = 1000  # ms (Window duration: 1 second)
+overlap_ms = 0  # ms (No overlap)
+window_size_samples = int(window_size_ms * sampling_rate / 1000)  # Calculate samples: 1000ms * 2000Hz / 1000 = 2000 samples
+# Removed step_size_samples as per request. Deque will advance by window_size_samples for non-overlapping windows.
+
+chunksize = 1000 # Chunk size for reading processed_*.csv files
+folder_path = r'C:\Users\พีค\OneDrive\เดสก์ท็อป\Data sci (NSTDA)\DataPrep'  # Folder containing processed_*.csv files
+output_folder = r'C:\Users\พีค\OneDrive\เดสก์ท็อป\Data sci (NSTDA)\train&test_window_2000_stepss_0'  # Output folder for cleaned single-grasp files
+num_emg_channels = 12
+
+# --- Signal Processing Parameters (Defined here for clarity) ---
+# Bandpass Filter
+lowcut_freq = 20  # Hz, Minimum frequency to pass
+highcut_freq = 450 # Hz, Maximum frequency to pass
+filter_order = 4   # Order of Butterworth filter
+
+# Notch Filter (for electrical noise, e.g., 50Hz or 60Hz)
+notch_freq = 50    # Hz (For Thailand, use 50Hz)
+notch_Q = 30       # Quality factor for Notch filter (High Q = narrow notch)
+
+# DWT Denoising (reducing noise with Wavelet Transform)
+dwt_wavelet = 'db4' # Type of Wavelet (e.g., 'db4', 'sym8')
+dwt_level = 2       # Level of Decomposition for DWT (Adjusted from 3 to 2 to avoid boundary effects)
+epsilon = 1e-10     # Small value to prevent division by zero in DWT thresholding
+
+# Create output folder if it doesn't exist
 os.makedirs(output_folder, exist_ok=True)
 
 def safe_parse_emg(emg_string):
     """
-    แปลง EMG signal ที่เป็น String ให้เป็น NumPy array พร้อมจัดการ Error ที่อาจเกิดขึ้น
-
-    Args:
-        emg_string (str): String ที่แทน EMG signal
-
-    Returns:
-        numpy.ndarray: EMG signal ในรูปแบบ NumPy array หรือ Array ว่างเปล่าหากมี Error
+    Converts EMG signal from String to NumPy array, handling potential errors.
     """
-    emg_string = emg_string.strip()  # ลบช่องว่างหน้าหลัง
-    if not emg_string:  # ตรวจสอบว่า String ว่างหรือไม่
+    emg_string = emg_string.strip()
+    if not emg_string:
         return np.array([])
+    # Remove surrounding brackets if present, otherwise ast.literal_eval expects a single value
     if emg_string.startswith("[") and emg_string.endswith("]"):
         emg_string = emg_string[1:-1]
     try:
-  
+        # Attempt to evaluate as a list first
         emg_list = ast.literal_eval(f"[{emg_string}]")
-        return np.array(emg_list, dtype=np.float32)  # ระบุ dtype
+        return np.array(emg_list, dtype=np.float32)
     except (ValueError, SyntaxError) as e:
+        # Fallback to np.fromstring for comma-separated values if ast.literal_eval fails
         try:
-        
+            # Replace multiple spaces with single commas, then strip leading/trailing commas
             cleaned_string = re.sub(r'\s+', ',', emg_string).strip(',')
-            return np.fromstring(cleaned_string, sep=',', dtype=np.float32)  # ระบุ dtype
+            return np.fromstring(cleaned_string, sep=',', dtype=np.float32)
         except Exception as e:
-            print(f"⚠️ Error parsing EMG: {e} | Data: '{emg_string[:100]}...'")
+            # print(f"⚠️ Error parsing EMG: {e} | Data: '{emg_string[:100]}...'") # Comment out to reduce console output
             return np.array([])
     except Exception as e:
-        print(f"⚠️ Error parsing EMG (initial): {e} | Data: '{emg_string[:100]}...'")
+        # print(f"⚠️ Error parsing EMG (initial): {e} | Data: '{emg_string[:100]}...'") # Comment out to reduce console output
         return np.array([])
-
-
 
 def safe_parse_grasp_ids(grasp_id):
     """
-    แปลง Grasp ID ที่เป็น String หรือ Value ให้เป็น List ของ Integer IDs
-
-    Args:
-        grasp_id (str, int, numpy.int64): Grasp ID(s) ที่ต้องการแปลง
-
-    Returns:
-        list: List ของ Integer Grasp IDs หรือ List ว่างเปล่าหากมี Error
+    Converts Grasp ID from String or Value to a List of Integer IDs.
     """
     if isinstance(grasp_id, str):
         grasp_id = grasp_id.strip()
@@ -68,16 +79,15 @@ def safe_parse_grasp_ids(grasp_id):
             return []
         if grasp_id.startswith("[") and grasp_id.endswith("]"):
             try:
-                
                 return [int(x) for x in ast.literal_eval(grasp_id)]
             except (ValueError, SyntaxError) as e:
-                print(f"⚠️ Error parsing Grasp IDs (string): {e} | Data: '{grasp_id[:100]}...'")
+                # print(f"⚠️ Error parsing Grasp IDs (string): {e} | Data: '{grasp_id[:100]}...'") # Comment out
                 return []
         else:
             try:
                 return [int(grasp_id)]
             except ValueError:
-                print(f"⚠️ Error parsing single Grasp ID (string): '{grasp_id}'")
+                # print(f"⚠️ Error parsing single Grasp ID (string): '{grasp_id}'") # Comment out
                 return []
     elif isinstance(grasp_id, (int, np.int64)):
         return [int(grasp_id)]
@@ -85,50 +95,151 @@ def safe_parse_grasp_ids(grasp_id):
         try:
             return [int(x) for x in grasp_id]
         except ValueError:
-            print(f"⚠️ Error parsing Grasp IDs (list): '{grasp_id}'")
+            # print(f"⚠️ Error parsing Grasp IDs (list): '{grasp_id}'") # Comment out
             return []
     else:
-        print(f"⚠️ Error: Unknown type for Grasp ID: {type(grasp_id)} | Value: '{grasp_id}'")
+        # print(f"⚠️ Error: Unknown type for Grasp ID: {type(grasp_id)} | Value: '{grasp_id}'") # Comment out
         return []
-
-
 
 def safe_parse_grasp_repetition(repetition_id):
     """
-    แปลง Grasp Repetition ID.  ส่งคืน None ถ้าเป็น 0 หรือมีปัญหา
-
-    Args:
-        repetition_id: Grasp Repetition ID ที่ต้องการแปลง
-
-    Returns:
-        int: ค่า Repetition ID ที่แปลงแล้ว, None หากมี Error หรือเป็น 0.
+    Converts Grasp Repetition ID. Returns None if 0 or problematic.
     """
     if isinstance(repetition_id, (int, np.int64)):
         if repetition_id == 0:
-            return None  # Return None for 0
+            return None
         return int(repetition_id)
     elif isinstance(repetition_id, str):
-        repetition_id = repetition_id.strip()  # remove white spaces
+        repetition_id = repetition_id.strip()
         if not repetition_id:
-            return None  # Return None for empty string
+            return None
         try:
             rep_id = int(repetition_id)
             if rep_id == 0:
-                return None # Return None if converted value is 0
+                return None
             return rep_id
         except ValueError:
-            print(f"⚠️ Error parsing Grasp Repetition ID (string): '{repetition_id}'")
+            # print(f"⚠️ Error parsing Grasp Repetition ID (string): '{repetition_id}'") # Comment out
             return None
     else:
-        print(
-            f"⚠️ Error: Unknown type for Grasp Repetition ID: {type(repetition_id)}, Value: '{repetition_id}'"
-        )
+        # print(f"⚠️ Error: Unknown type for Grasp Repetition ID: {type(repetition_id)}, Value: '{repetition_id}'") # Comment out
         return None
 
+# --- New function for Signal Preprocessing ---
+def apply_preprocessing(emg_data_flat, sampling_rate, num_channels,
+                        lowcut, highcut, filter_order,
+                        notch_freq, notch_Q,
+                        dwt_wavelet, dwt_level, epsilon):
+    """
+    Applies Bandpass filtering, Notch filtering, and DWT-based denoising to EMG data.
+    
+    Args:
+        emg_data_flat (np.array): Flat EMG data for one Time Segment
+                                  (e.g., one row from CSV), expected shape (num_time_points * num_channels,)
+        sampling_rate (int): Sampling rate in Hz
+        num_channels (int): Number of EMG channels
+        lowcut (float): Lower cutoff frequency for Bandpass filter
+        highcut (float): Upper cutoff frequency for Bandpass filter
+        filter_order (int): Order of Butterworth filter
+        notch_freq (float): Frequency to notch out (e.g., 50 or 60 Hz)
+        notch_Q (float): Quality factor for Notch filter
+        dwt_wavelet (str): Wavelet name for DWT (e.g., 'db4')
+        dwt_level (int): Decomposition level for DWT
+        epsilon (float): Small value to prevent division by zero
 
+    Returns:
+        np.array: Processed EMG data, flattened back to (num_time_points * num_channels,)
+    """
+    if emg_data_flat.size == 0:
+        return emg_data_flat
+
+    # Reshape data to (number of time points in segment, number of channels) for per-channel processing
+    num_time_points_in_segment = emg_data_flat.size // num_channels
+    if num_time_points_in_segment == 0:
+        return emg_data_flat
+    
+    emg_data_reshaped = emg_data_flat.reshape(num_time_points_in_segment, num_channels)
+    processed_emg_data = np.zeros_like(emg_data_reshaped, dtype=np.float32)
+
+    nyquist = 0.5 * sampling_rate
+
+    # Calculate Bandpass filter coefficients
+    normalized_lowcut = lowcut / nyquist
+    normalized_highcut = highcut / nyquist
+    
+    # Ensure cutoff frequencies are valid (0 to 1, where 1 is Nyquist)
+    if normalized_highcut >= 1.0: 
+        normalized_highcut = 0.99
+    if normalized_lowcut >= normalized_highcut: 
+        normalized_lowcut = normalized_highcut * 0.1 
+
+    b_band, a_band = butter(filter_order, [normalized_lowcut, normalized_highcut], btype='band')
+    
+    # Calculate Notch filter coefficients
+    normalized_notch_freq = notch_freq / nyquist
+    if normalized_notch_freq >= 1.0: # Ensure notch_freq is below Nyquist
+        normalized_notch_freq = 0.99
+    b_notch, a_notch = iirnotch(normalized_notch_freq, notch_Q)
+
+    for ch_idx in range(num_channels):
+        channel_signal = emg_data_reshaped[:, ch_idx]
+
+        # 1. Bandpass Filtering
+        # filtfilt needs signal length > filter order to work correctly
+        if len(channel_signal) > filter_order: 
+            filtered_signal = filtfilt(b_band, a_band, channel_signal)
+        else:
+            filtered_signal = channel_signal.copy()
+
+        # 2. Notch Filtering
+        if len(filtered_signal) > filter_order: 
+            filtered_signal = filtfilt(b_notch, a_notch, filtered_signal)
+        else:
+            pass # If too short, skip Notch filter
+
+        # 3. DWT Denoising (reducing noise with Wavelet Transform)
+        # Check if signal has sufficient data and is not nearly zero before DWT
+        if len(filtered_signal) > 0 and np.sum(np.abs(filtered_signal)) > 1e-6:
+            try:
+                # Perform Discrete Wavelet Transform
+                # Check minimum length for DWT level
+                min_len_for_dwt = pywt.dwt_coeff_len(len(filtered_signal), dwt_wavelet, mode='symmetric')
+                if len(filtered_signal) < min_len_for_dwt or dwt_level >= pywt.dwt_max_level(len(filtered_signal), dwt_wavelet):
+                    # If signal is too short for chosen DWT level, use original filtered signal
+                    denoised_signal = filtered_signal
+                else:
+                    coeffs = pywt.wavedec(filtered_signal, dwt_wavelet, level=dwt_level)
+                    
+                    # Estimate Noise Standard Deviation (Universal threshold)
+                    # Add epsilon to prevent division by zero
+                    sigma = np.median(np.abs(coeffs[-1])) / (0.6745 + epsilon)
+                    threshold = sigma * np.sqrt(2 * np.log(len(filtered_signal)))
+
+                    # Denoising using Soft Thresholding on Detail Coefficients
+                    denoised_coeffs = [coeffs[0]] # Approximation coefficient is kept as is
+                    for i in range(1, len(coeffs)):
+                        denoised_coeffs.append(pywt.threshold(coeffs[i], threshold, mode='soft'))
+                    
+                    # Reconstruct signal from denoised coefficients
+                    denoised_signal = pywt.waverec(denoised_coeffs, dwt_wavelet)
+
+                    # Ensure reconstructed signal length matches original segment length
+                    if len(denoised_signal) != len(channel_signal):
+                        denoised_signal = denoised_signal[:len(channel_signal)]
+            except ValueError as ve:
+                # print(f"Warning: DWT ValueError for channel {ch_idx}: {ve}. Using filtered signal.")
+                denoised_signal = filtered_signal
+            except Exception as e:
+                # print(f"Warning: DWT Denoising failed for channel {ch_idx}: {e}. Using filtered signal.")
+                denoised_signal = filtered_signal
+        else:
+            denoised_signal = filtered_signal # If signal is empty or zero, skip DWT
+
+        processed_emg_data[:, ch_idx] = denoised_signal
+
+    return processed_emg_data.flatten()
 
 start_time_all = time.time()
-
 
 processed_files = [
     f for f in os.listdir(folder_path) if f.startswith("processed_") and f.endswith(".csv")
@@ -139,9 +250,7 @@ if not processed_files:
 else:
     for filename in processed_files:
         file_path = os.path.join(folder_path, filename)
-        patient_id = filename.split("_")[-1].split(".")[
-            0
-        ]  # ดึง 'S010' จาก 'processed_S010.csv'
+        patient_id = filename.split("_")[-1].split(".")[0]
         output_cleaned_file = os.path.join(
             output_folder, f"cleaned_single_grasp_{patient_id}.csv"
         )
@@ -149,33 +258,29 @@ else:
         print(f"\n--- กำลังประมวลผลไฟล์: {os.path.basename(file_path)} ---")
         start_time_file = time.time()
         total_processing_time_file = 0
-        total_emg_points_file = 0
-        all_windows_data_single = []
-        all_windows_grasp_ids_single = []
-        all_windows_repetition_ids_single = (
-            []
-        )  # To store repetition ids, now will hold None if no rep_id
-        total_windows_file = 0
+        total_emg_points_file = 0 # To track total EMG points processed in this file
+        total_windows_file = 0 # To track total windows generated and saved for this file
         multi_grasp_windows_count = 0
-        error_count_file = 0  # Count errors in a file
-        files_without_repetition_id = (
-            []
-        )  # Keep track of files without repetition ID
-        problematic_files = []
+        error_count_file = 0
+        files_without_repetition_id_flag = False
+        problematic_files_flag = False
+
+        first_write_to_output_file = True
 
         try:
             df_chunks = pd.read_csv(
                 file_path, iterator=True, chunksize=chunksize, on_bad_lines="warn"
             )
-            current_emg_data = deque(maxlen=window_size_samples * 2)
-            current_grasp_ids = deque(maxlen=window_size_samples * 2)
-            current_repetition_ids = deque(
-                maxlen=window_size_samples * 2
-            )  # track repetition ids
+            
+            # Deques should have maxlen as the required samples in a window
+            current_emg_data = deque(maxlen=window_size_samples * num_emg_channels)
+            current_grasp_ids = deque(maxlen=window_size_samples)
+            current_repetition_ids = deque(maxlen=window_size_samples)
 
             for chunk in tqdm(
                 df_chunks, desc=f"อ่านและประมวลผล {os.path.basename(file_path)}"
             ):
+                # Filter out 'Grasp ID' that is 0
                 chunk_filtered = chunk[chunk["Grasp ID"] != 0].copy()
 
                 if (
@@ -187,9 +292,6 @@ else:
                     grasp_ids_chunk = chunk_filtered["Grasp ID"].dropna().values
                     repetition_ids_chunk = (
                         chunk_filtered["Grasp Repetition"].dropna().values
-                    )  # Get repetition ids
-                    total_emg_points_file += sum(
-                        len(safe_parse_emg(s)) for s in emg_signal_strings
                     )
 
                     for (
@@ -198,84 +300,121 @@ else:
                         repetition_id,
                     ) in zip(
                         emg_signal_strings, grasp_ids_chunk, repetition_ids_chunk
-                    ):  # add repetition_id
+                    ):
                         emg_array = safe_parse_emg(emg_str)
+                        
+                        # --- Call Signal Preprocessing function here ---
+                        if emg_array.size > 0:
+                            emg_array = apply_preprocessing(
+                                emg_array,
+                                sampling_rate,
+                                num_emg_channels,
+                                lowcut_freq,
+                                highcut_freq,
+                                filter_order,
+                                notch_freq,
+                                notch_Q,
+                                dwt_wavelet,
+                                dwt_level,
+                                epsilon 
+                            )
+                        # --- End Signal Preprocessing call ---
+
                         parsed_grasp_ids = safe_parse_grasp_ids(grasp_id)
                         parsed_repetition_id = safe_parse_grasp_repetition(
                             repetition_id
-                        )  # Parse repetition id
+                        )
 
                         if (
                             emg_array.size > 0
                             and parsed_grasp_ids
                             and parsed_repetition_id is not None
-                        ):  # Check for valid repetition id
+                        ):
+                            if emg_array.size % num_emg_channels != 0:
+                                error_count_file += 1
+                                continue
+
                             emg_list = emg_array.tolist()
+                            total_emg_points_file += emg_array.size
                             current_emg_data.extend(emg_list)
-                            # ทำซ้ำ Grasp ID ตามจำนวนจุด EMG ที่สอดคล้องกัน
+                            
+                            num_time_points_in_emg_list = len(emg_list) // num_emg_channels
+
                             if len(parsed_grasp_ids) == 1:
-                                current_grasp_ids.extend([parsed_grasp_ids[0]] * len(emg_list))
+                                current_grasp_ids.extend([parsed_grasp_ids[0]] * num_time_points_in_emg_list)
                                 current_repetition_ids.extend(
-                                    [parsed_repetition_id] * len(emg_list)
-                                )  # Propagate repetition id
-                            elif len(parsed_grasp_ids) == len(emg_list):
+                                    [parsed_repetition_id] * num_time_points_in_emg_list
+                                )
+                            elif len(parsed_grasp_ids) == num_time_points_in_emg_list:
                                 current_grasp_ids.extend(parsed_grasp_ids)
                                 current_repetition_ids.extend(
-                                    [parsed_repetition_id] * len(emg_list)
-                                )  # Propagate repetition ids
-                            else:
-                                print(
-                                    f"⚠️ Warning: ขนาดของ Grasp IDs ไม่ตรงกับ EMG Signal ในแถว ในไฟล์: {os.path.basename(file_path)}"
+                                    [parsed_repetition_id] * num_time_points_in_emg_list
                                 )
+                            else:
                                 error_count_file += 1
-                                continue  # ข้าม iteration นี้หากขนาดไม่ตรงกัน
+                                continue
+
                         else:
                             error_count_file += 1
                             if parsed_repetition_id is None:
-                                files_without_repetition_id.append(
-                                    filename
-                                )  # Track file
+                                files_without_repetition_id_flag = True
 
-                    while len(current_emg_data) >= window_size_samples:
-                        window_emg = list(current_emg_data)[:window_size_samples]
+                    # --- Non-overlapping Window Processing and Direct Writing ---
+                    # Advance deque by window_size_samples because overlap_ms is 0
+                    while len(current_emg_data) >= window_size_samples * num_emg_channels:
+                        window_emg_flat = list(current_emg_data)[:window_size_samples * num_emg_channels]
+                        window_emg_reshaped = np.array(window_emg_flat, dtype=np.float32).reshape(window_size_samples, num_emg_channels)
+                        
                         window_grasp = list(current_grasp_ids)[:window_size_samples]
-                        window_repetition = list(
-                            current_repetition_ids
-                        )[:window_size_samples]  # Get window repetition ids
+                        window_repetition = list(current_repetition_ids)[:window_size_samples]
+                        
                         total_windows_file += 1
 
-                        # ตรวจสอบว่ามี grasp id มากกว่า 1 ใน window หรือไม่
                         unique_grasps = set(window_grasp)
+                        unique_repetition_ids = set(window_repetition)
+
                         if (
                             len(unique_grasps) == 1
-                            and window_repetition[0] is not None
-                        ):  # Only process if single grasp and has repetition
-                            all_windows_data_single.append(window_emg)
-                            all_windows_grasp_ids_single.append(list(unique_grasps)[0])
-                            all_windows_repetition_ids_single.append(
-                                window_repetition[0]
-                            )  # store repetition id
+                            and len(unique_repetition_ids) == 1
+                            and list(unique_repetition_ids)[0] is not None
+                        ):
+                            window_data_dict = {}
+                            for ch_idx in range(num_emg_channels):
+                                for s_idx in range(window_size_samples):
+                                    window_data_dict[f'EMG_Ch{ch_idx+1}_Smp{s_idx+1}'] = window_emg_reshaped[s_idx, ch_idx]
+                            
+                            window_data_dict['grasp_id'] = list(unique_grasps)[0]
+                            window_data_dict['Grasp Repetition'] = list(unique_repetition_ids)[0]
+                            
+                            df_single_window = pd.DataFrame([window_data_dict])
+                            
+                            if first_write_to_output_file:
+                                df_single_window.to_csv(output_cleaned_file, mode="w", header=True, index=False)
+                                first_write_to_output_file = False
+                            else:
+                                df_single_window.to_csv(output_cleaned_file, mode="a", header=False, index=False)
+                            
+                            del df_single_window
+                            gc.collect()
+
                         else:
                             multi_grasp_windows_count += 1
-                            if (
-                                len(unique_grasps) == 1
-                            ):  # if single grasp, but no repetition id.
-                                files_without_repetition_id.append(
-                                    filename
-                                )  # Track the file
-                            # Discard the window.  We only want windows with single grasp and repetition id.
+                            if (len(unique_grasps) == 1 and
+                                (len(unique_repetition_ids) > 1 or list(unique_repetition_ids)[0] is None)):
+                                files_without_repetition_id_flag = True
 
+                        # Advance the deques by window_size_samples for non-overlapping windows
                         current_emg_data = deque(
-                            list(current_emg_data)[step_size_samples:],
-                            maxlen=window_size_samples * 2,
+                            list(current_emg_data)[window_size_samples * num_emg_channels:], # Use window_size_samples directly
+                            maxlen=window_size_samples * num_emg_channels,
                         )
                         current_grasp_ids = deque(
-                            list(current_grasp_ids)[step_size_samples:],
-                            maxlen=window_size_samples * 2,
+                            list(current_grasp_ids)[window_size_samples:], # Use window_size_samples directly
+                            maxlen=window_size_samples,
                         )
                         current_repetition_ids = deque(
-                            list(current_repetition_ids)[step_size_samples:],
-                            maxlen=window_size_samples * 2,
+                            list(current_repetition_ids)[window_size_samples:], # Use window_size_samples directly
+                            maxlen=window_size_samples,
                         )
 
                 else:
@@ -283,36 +422,21 @@ else:
                         f"⚠️ Warning: ไม่พบคอลัมน์ 'EMG Signal' หรือ 'Grasp ID' หรือ 'Grasp Repetition' ในไฟล์ {os.path.basename(file_path)}. ข้ามการประมวลผล EMG."
                     )
                     error_count_file += 1
+                    problematic_files_flag = True
 
-            del chunk
-            del chunk_filtered
-            gc.collect()
+                del chunk
+                del chunk_filtered
+                gc.collect()
 
         except Exception as e:
             print(f"❌ Error processing {os.path.basename(file_path)}: {e}")
-            problematic_files.append(filename)  # Keep track of problem files.
-            continue  # Continue to the next file
+            problematic_files_flag = True
+            continue
 
         end_time_file = time.time()
         total_processing_time_file = end_time_file - start_time_file
         minutes_file = int(total_processing_time_file // 60)
         seconds_file = int(total_processing_time_file % 60)
-
-        # บันทึกข้อมูลที่ถูกแยกให้เหลือ grasp id เดี่ยว และมี repetition id
-        if all_windows_data_single:
-            print(
-                f"กำลังบันทึก Windows ที่มี Grasp ID เดี่ยว และ Grasp Repetition ID ลงไฟล์: {os.path.basename(output_cleaned_file)}"
-            )
-            df_cleaned_windows_emg_single = pd.DataFrame(all_windows_data_single)
-            df_cleaned_windows_emg_single["grasp_id"] = all_windows_grasp_ids_single  # Add grasp_id column
-            df_cleaned_windows_emg_single["Grasp Repetition"] = all_windows_repetition_ids_single  # Add grasp_repetition_id column, changed name
-            df_cleaned_windows_emg_single.to_csv(
-                output_cleaned_file, mode="w", header=True, index=False
-            )
-        else:
-            print(
-                f"⚠️ Warning: ไม่พบ Windows ที่มี Grasp ID เดี่ยว และ Grasp Repetition ID ในไฟล์ {os.path.basename(file_path)}. ไม่มีการบันทึกไฟล์."
-            )
 
         window_duration_seconds = window_size_samples / sampling_rate
         total_duration_seconds = total_windows_file * window_duration_seconds
@@ -325,21 +449,27 @@ else:
         print(f"\n--- สรุปการประมวลผลไฟล์: {os.path.basename(file_path)} ---")
         print(f"ใช้เวลา: {minutes_file} นาที {seconds_file} วินาที")
         print(
-            f"จำนวนข้อมูล EMG ทั้งหมด: {total_emg_points_file} จุด ({total_emg_duration_minutes} นาที {total_emg_duration_remaining_seconds} วินาที)"
+            f"จำนวนข้อมูล EMG ทั้งหมดที่ประมวลผล: {total_emg_points_file} จุด ({total_emg_duration_minutes} นาที {total_emg_duration_remaining_seconds} วินาที)"
         )
-        print(f"จำนวน Windows ที่สร้างได้ทั้งหมด: {total_windows_file} windows")
-        print(f"จำนวน Windows ที่มี Grasp ID มากกว่า 1: {multi_grasp_windows_count} windows")
-        print(f"จำนวน Error ในการประมวลผล: {error_count_file}")
-        if files_without_repetition_id:
-            print(
-                f"จำนวนไฟล์ที่ไม่มี Grasp Repetition ID: {len(files_without_repetition_id)}"
-            )
+        print(f"จำนวน Windows ที่สร้างและบันทึกได้ทั้งหมด: {total_windows_file} windows")
+        print(f"จำนวน Windows ที่ถูกกรองออก (Grasp ID มากกว่า 1 หรือ Repetition ID ไม่สอดคล้องกัน/ไม่มี): {multi_grasp_windows_count} windows")
+        print(f"จำนวน Error ในการประมวลผล (ภายในไฟล์): {error_count_file}")
+        if files_without_repetition_id_flag:
+            print(f"⚠️ พบ Windows ที่ไม่มี Grasp Repetition ID ในไฟล์นี้")
+        if problematic_files_flag:
+            print(f"⚠️ พบข้อผิดพลาดทั่วไปในการประมวลผลไฟล์นี้")
         print(f"ขนาด Window: {window_size_samples} ช่องสัญญาณ ({window_duration_seconds:.3f} วินาที)")
-        print(f"Overlap: {overlap_percent * 100:.0f}% (Step size: {step_size_samples} ช่องสัญญาณ)")
+        print(f"จำนวนช่องสัญญาณ EMG: {num_emg_channels}")
+        # Updated overlap description for clarity
+        print(f"Overlap: 0% (เป็น Non-overlapping Window)") 
         print(
             f"ระยะเวลาทั้งหมดของ window ทั้งหมด: {total_duration_minutes} นาที {total_duration_remaining_seconds} วินาที"
         )
 
+        # Clear deques and explicitly call garbage collection after each file is processed
+        current_emg_data.clear()
+        current_grasp_ids.clear()
+        current_repetition_ids.clear()
         gc.collect()
 
     end_time_all = time.time()
@@ -350,13 +480,7 @@ else:
     print(f"\n--- สิ้นสุดการประมวลผลไฟล์ทั้งหมด ---")
     print(f"ใช้เวลาประมวลผลทั้งหมด: {minutes_all} นาที {seconds_all} วินาที")
 
-    if problematic_files:
-        print("⚠️ ไฟล์ที่มีปัญหาในการประมวลผล:")
-        for filename in problematic_files:
-            print(filename)
-    if files_without_repetition_id:
-        print("⚠️ ไฟล์ที่ไม่มี Grasp Repetition ID:")
-        for filename in files_without_repetition_id:
-            print(filename)
+    print("การประมวลผลเสร็จสิ้น (อาจมี Warning บางส่วนถูกปิดเพื่อลด Output)")
 
     gc.collect()
+aa
