@@ -1,0 +1,338 @@
+import numpy as np
+import pandas as pd
+import os
+import time
+from scipy.fft import fft, fftfreq
+from statsmodels.regression.linear_model import yule_walker
+from tqdm import tqdm
+from scipy.stats import skew, kurtosis, median_abs_deviation
+from collections import defaultdict
+import traceback
+import re # Import regular expression module
+
+# --- Configuration (ตั้งค่าพื้นฐาน) ---
+random_seed = 42
+ar_order = 1 # Order สำหรับ Autoregressive (AR) coefficients
+             # สามารถพิจารณาเพิ่มค่านี้เป็น 4 หรือ 6 เพื่อการแสดง Feature ที่ดีขึ้น
+sampling_rate = 2000    # Hz (อัตราการสุ่มตัวอย่าง)
+
+# --- Paths for Data ---
+cleaned_data_folder = r'/home/ubuntu/Documents/Peak/EMG signal/window_1000_step_200'
+# Adjusted output folder name to reflect the new window size (500ms derived from 1000 samples at 2000Hz)
+extracted_features_output_folder = r'/home/ubuntu/Documents/Peak/extracted_features_500ms_output' # โฟลเดอร์สำหรับเก็บ Features ที่ Extract แล้ว
+
+# Get list of files and sort them numerically
+files_to_process = [f for f in os.listdir(cleaned_data_folder) if f.endswith('.csv')]
+
+# Sort files numerically based on the number in their name (e.g., S010, S011, S012)
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+
+files_to_process.sort(key=natural_sort_key)
+
+
+if not files_to_process:
+    print(f"⚠️ Warning: ไม่พบไฟล์ .csv ในโฟลเดอร์ '{cleaned_data_folder}'. โปรดตรวจสอบเส้นทางและเนื้อหาของโฟลเดอร์.")
+    exit()
+
+# --- Feature Extraction Function ---
+def extract_complex_features(window_data, ar_order=ar_order, sampling_rate=sampling_rate): # Use global sampling_rate
+    features_list = []
+
+    if len(window_data) > 0:
+        window_data = np.asarray(window_data, dtype=np.float64)
+
+        # --- Time Domain Features ---
+        mean = np.mean(window_data)
+        std = np.std(window_data)
+        rms = np.sqrt(np.mean(np.square(window_data)))
+        var = np.var(window_data)
+        skewness = skew(window_data)
+        kurt = kurtosis(window_data)
+
+        threshold_emav = 0.005 # Adjustable threshold
+        emav_filtered_data = np.abs(window_data[np.abs(window_data) > threshold_emav])
+        emav = np.mean(emav_filtered_data) if emav_filtered_data.size > 0 else 0
+
+        waveform_length = np.sum(np.abs(np.diff(window_data))) if len(window_data) > 1 else 0
+
+        threshold_ewl = 0.001 # Adjustable threshold
+        diff_data = np.abs(np.diff(window_data))
+        ewl_filtered_diff = diff_data[diff_data > threshold_ewl]
+        ewl = np.sum(ewl_filtered_diff) if ewl_filtered_diff.size > 0 else 0
+
+        mabs_diff = np.abs(np.diff(window_data))
+        mavs = np.mean(mabs_diff) if len(mabs_diff) > 0 else 0
+
+        threshold_zc = 0.01
+        zc = np.sum((window_data[:-1] * window_data[1:]) < -threshold_zc) if len(window_data) > 1 else 0
+
+        threshold_ssc = 0.01
+        diff_window = np.diff(window_data)
+        ssc = np.sum((diff_window[:-1] * diff_window[1:]) < -threshold_ssc) if len(diff_window) > 1 else 0
+
+        ld = np.exp(np.mean(np.log(np.abs(window_data) + 1e-10))) if np.sum(np.abs(window_data)) > 0 else 0
+
+        threshold_wamp = 0.001 # Adjustable threshold for WAMP
+        wamp = np.sum(np.abs(np.diff(window_data)) > threshold_wamp) if len(window_data) > 1 else 0
+
+        ssi = np.sum(np.square(window_data))
+        iemg = np.sum(np.abs(window_data))
+
+        max_amp = np.max(window_data)
+        min_amp = np.min(window_data)
+        ptp_amp = max_amp - min_amp
+
+        cf = (max_amp / (rms + 1e-10)) if rms > 0 else 0
+        ff = (rms / (emav + 1e-10)) if emav > 0 else 0
+        varl = np.var(np.log(np.abs(window_data) + 1e-10)) if np.sum(np.abs(window_data)) > 0 else 0
+        rmssd = np.sqrt(np.mean(np.diff(window_data)**2)) if len(window_data) > 1 else 0
+
+        # Median Absolute Deviation (MAD)
+        mad = median_abs_deviation(window_data) if len(window_data) > 0 else 0.0
+
+        # Hjorth Parameters
+        first_deriv = np.diff(window_data)
+        second_deriv = np.diff(first_deriv)
+
+        mobility = 0.0
+        complexity = 0.0
+
+        if np.std(window_data) > 1e-10:
+            mobility = np.std(first_deriv) / np.std(window_data) if len(first_deriv) > 0 else 0.0
+
+        if mobility > 1e-10:
+            complexity = (np.std(second_deriv) / np.std(first_deriv)) / mobility if len(second_deriv) > 0 else 0.0
+
+        mobility = np.nan_to_num(mobility, nan=0.0, posinf=0.0, neginf=0.0)
+        complexity = np.nan_to_num(complexity, nan=0.0, posinf=0.0, neginf=0.0)
+
+        features_list.extend([
+            mean, std, rms, var, skewness, kurt,
+            emav, waveform_length, ewl, mavs, zc, ssc,
+            ld, wamp, ssi, iemg,
+            max_amp, min_amp, ptp_amp, cf, ff, varl,
+            rmssd, mad,
+            mobility, complexity
+        ])
+
+        # --- Frequency Domain Features (using FFT) ---
+        N_fft = len(window_data)
+        mean_freq, std_freq, mdf, sc, total_power, sef = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        band_power_100hz = 0.0
+        band_power_200hz = 0.0
+        band_power_300hz = 0.0
+        band_power_500hz = 0.0
+
+        if N_fft > 1:
+            yf = fft(window_data)
+            psd = np.abs(yf[1:N_fft//2])**2
+            freqs = fftfreq(N_fft, 1/sampling_rate)[1:N_fft//2]
+
+            if psd.size > 0 and np.sum(psd) > 0:
+                sum_psd = np.sum(psd)
+                mean_freq = np.sum(freqs * psd) / sum_psd
+                std_freq = np.sqrt(np.sum((freqs - mean_freq)**2 * psd) / sum_psd) if sum_psd > 0 else 0
+                total_power = sum_psd
+                cumulative_power = np.cumsum(psd)
+                mdf_idx = np.where(cumulative_power >= total_power / 2)[0]
+                mdf = freqs[mdf_idx[0]] if mdf_idx.size > 0 else 0
+                sef_threshold_percent = 0.90
+                sef_idx = np.where(cumulative_power >= total_power * sef_threshold_percent)[0]
+                sef = freqs[sef_idx[0]] if sef_idx.size > 0 else 0
+                sc = np.sum(freqs * psd) / sum_psd if sum_psd > 0 else 0
+
+                idx_band1 = np.where((freqs >= 0) & (freqs < 100))[0]
+                idx_band2 = np.where((freqs >= 100) & (freqs < 200))[0]
+                idx_band3 = np.where((freqs >= 200) & (freqs < 300))[0]
+                idx_band4 = np.where((freqs >= 300) & (freqs <= sampling_rate / 2))[0]
+
+                band_power_100hz = np.sum(psd[idx_band1]) if idx_band1.size > 0 else 0.0
+                band_power_200hz = np.sum(psd[idx_band2]) if idx_band2.size > 0 else 0.0
+                band_power_300hz = np.sum(psd[idx_band3]) if idx_band3.size > 0 else 0.0
+                band_power_500hz = np.sum(psd[idx_band4]) if idx_band4.size > 0 else 0.0
+
+        features_list.extend([
+            mean_freq, std_freq, mdf, sc, total_power, sef,
+            band_power_100hz, band_power_200hz, band_power_300hz, band_power_500hz
+        ])
+
+        # --- Autoregressive (AR) Coefficients ---
+        ar_burg_coeffs = [0.0] * ar_order
+        if len(window_data) >= ar_order + 1 and np.sum(np.abs(window_data)) > 1e-6:
+            try:
+                rho_burg, _ = yule_walker(window_data, ar_order, method='burg')
+                ar_burg_coeffs = rho_burg.tolist()
+            except Exception:
+                ar_burg_coeffs = [0.0] * ar_order
+        features_list.extend(ar_burg_coeffs)
+
+        ar_yw_coeffs = [0.0] * ar_order
+        if len(window_data) >= ar_order + 1 and np.sum(np.abs(window_data)) > 1e-6:
+            try:
+                rho_yw, _ = yule_walker(window_data, ar_order, method='mle')
+                ar_yw_coeffs = rho_yw.tolist()
+            except Exception:
+                ar_yw_coeffs = [0.0] * ar_order
+        features_list.extend(ar_yw_coeffs)
+
+        return features_list
+    else:
+        # กำหนดจำนวน Features ที่คาดว่าจะได้เพื่อเติมด้วย 0 หาก window_data ว่างเปล่า
+        # 26 (Time) + 10 (Freq) + (ar_order * 2) (AR coeffs)
+        total_features_count_expected = 26 + 10 + (ar_order * 2)
+        return [0.0] * total_features_count_expected
+
+# --- Global parameters for EMG data structure ---
+# Changed window_size_samples to 1000 as requested (500ms at 2000Hz)
+window_size_samples = 1000
+# คำนวณจำนวน features ต่อ channel: 26 (Time) + 10 (Freq) + (ar_order * 2) (AR coeffs)
+num_features_per_channel = 26 + 10 + (ar_order * 2)
+EXPECTED_NUM_EMG_CHANNELS = 12
+
+# --- Function: Extract and Save Features to Parquet ---
+def extract_and_save_features(input_folder, output_folder, files_list, window_size_samples, num_features_per_channel, expected_num_emg_channels, ar_order):
+    os.makedirs(output_folder, exist_ok=True)
+
+    print(f"--- กำลังเริ่มการ Extract Features และบันทึกเป็นไฟล์ Parquet ---")
+
+    for file_name in files_list:
+        file_path = os.path.join(input_folder, file_name)
+        output_parquet_path = os.path.join(output_folder, os.path.splitext(file_name)[0] + '.parquet')
+
+        # Re-added the check for existing parquet file to skip reprocessing
+        if os.path.exists(output_parquet_path):
+            print(f"ไฟล์ Features สำหรับ {file_name} มีอยู่แล้วที่ {output_parquet_path}. ข้ามการ Extract.")
+            continue # ข้ามถ้าไฟล์ Parquet ถูกสร้างแล้ว
+
+        current_file_identifier = os.path.splitext(file_name)[0]
+
+        print(f"กำลังโหลดข้อมูลจากไฟล์: {file_path}")
+
+        try:
+            df = pd.read_csv(file_path)
+
+            if 'grasp_id' not in df.columns or 'Grasp Repetition' not in df.columns:
+                print(f"⚠️ Warning: คอลัมน์ 'grasp_id' หรือ 'Grasp Repetition' ไม่พบในไฟล์ {os.path.basename(file_path)}. ข้ามไฟล์นี้.")
+                continue
+            elif df.empty:
+                print(f"⚠️ Warning: ไฟล์ {os.path.basename(file_path)} ว่างเปล่า. ไม่สามารถประมวลผลได้.")
+                continue
+            else:
+                emg_channel_cols_map = defaultdict(list)
+                max_smp_num_in_file = 0
+
+                for col in df.columns:
+                    if col.startswith('EMG_Ch'):
+                        parts = col.split('_')
+                        if len(parts) == 3 and parts[0] == 'EMG' and parts[1].startswith('Ch') and parts[2].startswith('Smp'):
+                            try:
+                                ch_num = int(parts[1].replace('Ch', ''))
+                                smp_num = int(parts[2].replace('Smp', ''))
+                                emg_channel_cols_map[ch_num].append(col)
+                                if smp_num > max_smp_num_in_file:
+                                    max_smp_num_in_file = smp_num
+                            except ValueError:
+                                continue
+
+                for ch_num in emg_channel_cols_map:
+                    emg_channel_cols_map[ch_num].sort(key=lambda x: int(x.split('_Smp')[1]))
+
+                actual_num_emg_channels_in_file = len(emg_channel_cols_map)
+
+                if actual_num_emg_channels_in_file != expected_num_emg_channels:
+                    print(f"⏩ ข้ามไฟล์ {os.path.basename(file_path)}: จำนวนช่องสัญญาณ EMG ({actual_num_emg_channels_in_file}) ไม่เท่ากับที่คาดหวัง ({expected_num_emg_channels}).")
+                    continue
+
+                if max_smp_num_in_file > 0 and max_smp_num_in_file != window_size_samples:
+                    print(f"⚠️ Warning: ไฟล์ {os.path.basename(file_path)} มีจำนวน Samples ต่อช่องสัญญาณ ({max_smp_num_in_file}) ไม่เท่ากับค่าที่กำหนด ({window_size_samples}). อาจเกิดปัญหาหากใช้ Window Size ที่ไม่คงที่.")
+
+                grasp_ids = df['grasp_id'].values.astype(int)
+                repetition_ids = df['Grasp Repetition'].values.astype(int)
+
+                file_features = []
+                file_labels = []
+                file_repetition_ids = []
+                file_identifiers = []
+
+                for idx in tqdm(range(len(df)), desc=f"กำลังสร้าง Features จาก {os.path.basename(file_path)}"):
+                    row_features = []
+
+                    for ch_idx_iter in range(1, expected_num_emg_channels + 1):
+                        channel_sample_cols = emg_channel_cols_map[ch_idx_iter]
+
+                        if len(channel_sample_cols) == window_size_samples:
+                            channel_data = df.loc[idx, channel_sample_cols].values.astype(float)
+                            extracted_channel_features = extract_complex_features(
+                                channel_data,
+                                ar_order=ar_order,
+                                sampling_rate=sampling_rate # Use global sampling_rate
+                            )
+                            row_features.extend(extracted_channel_features)
+                        else:
+                            print(f"    ⚠️ Warning: จำนวน Samples ในช่องสัญญาณ EMG_Ch{ch_idx_iter} สำหรับแถวที่ {idx} ในไฟล์ {os.path.basename(file_path)} ไม่ตรงกับ window_size_samples ({window_size_samples}). เติมศูนย์แทนข้อมูลช่องสัญญาณนี้ (ไม่ควรเกิดขึ้นหลังการกรอง).")
+                            row_features.extend([0.0] * num_features_per_channel)
+
+                    file_features.append(row_features)
+                    file_labels.append(grasp_ids[idx])
+                    file_repetition_ids.append(repetition_ids[idx])
+                    file_identifiers.append(current_file_identifier)
+
+                # Create a DataFrame for the current file's features
+                feature_names = []
+                # ชื่อของ Time Domain Features
+                feature_base_names = [
+                    'mean', 'std', 'rms', 'var', 'skewness', 'kurt',
+                    'emav', 'waveform_length', 'ewl', 'mavs', 'zc', 'ssc',
+                    'ld', 'wamp', 'ssi', 'iemg',
+                    'max_amp', 'min_amp', 'ptp_amp', 'cf', 'ff', 'varl',
+                    'rmssd', 'mad',
+                    'mobility', 'complexity' # Corrected 'mobility, complexity' to be separate strings
+                ]
+                # เพิ่มชื่อ Frequency Domain Features
+                feature_base_names.extend([
+                    'mean_freq', 'std_freq', 'mdf', 'sc', 'total_power', 'sef',
+                    'band_power_100hz', 'band_power_200hz', 'band_power_300hz', 'band_power_500hz'
+                ])
+                # เพิ่มชื่อ AR Coefficients
+                for i in range(ar_order):
+                    feature_base_names.append(f'ar_burg_{i+1}')
+                for i in range(ar_order):
+                    feature_base_names.append(f'ar_yw_{i+1}')
+
+                for ch_num in range(1, expected_num_emg_channels + 1):
+                    for fname in feature_base_names:
+                        feature_names.append(f'Ch{ch_num}_{fname}')
+
+                df_features_current_file = pd.DataFrame(file_features, columns=feature_names)
+                df_features_current_file['grasp_id'] = file_labels
+                df_features_current_file['Grasp Repetition'] = file_repetition_ids
+                df_features_current_file['file_id'] = file_identifiers
+
+                # Save to Parquet
+                df_features_current_file.to_parquet(output_parquet_path, index=False)
+                print(f"✅ บันทึก Features ของ {len(df)} Windows จากไฟล์ {os.path.basename(file_name)} ลงใน {os.path.basename(output_parquet_path)}")
+
+        except KeyError as ke:
+            print(f"❌ Error: คอลัมน์ที่คาดไว้ (e.g., 'grasp_id', 'Grasp Repetition', หรือ EMG samples) ไม่พบในไฟล์ {os.path.basename(file_path)}: {ke}. ตรวจสอบโครงสร้างไฟล์.")
+        except Exception as e:
+            print(f"❌ เกิดข้อผิดพลาดในการโหลดหรือประมวลผลไฟล์ {os.path.basename(file_path)}: {e}")
+            traceback.print_exc() # Print full traceback for debugging
+
+    print(f"--- การ Extract Features และบันทึกทั้งหมดเสร็จสิ้น ---")
+
+
+# --- RUN EXTRACTION ONLY ---
+start_time_total = time.time()
+extract_and_save_features(
+    cleaned_data_folder,
+    extracted_features_output_folder,
+    files_to_process,
+    window_size_samples,
+    num_features_per_channel,
+    EXPECTED_NUM_EMG_CHANNELS,
+    ar_order
+)
+end_time_total = time.time()
+print(f"\nรวมเวลาทั้งหมดในการ Extract Features และบันทึก: {(end_time_total - start_time_total):.2f} วินาที")
